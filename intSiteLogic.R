@@ -1,10 +1,28 @@
+## load hiReadsProcessor.R
+libs <- c("BiocParallel", "Biostrings", "GenomicAlignments" ,"hiAnnotator" ,"plyr", "sonicLength", "GenomicRanges", "BiocGenerics")
+junk <- sapply(libs, require, character.only=TRUE)
+if( any(!junk) ) {
+    message("Libs not loaded:")
+    print(data.frame(Loaded=junk[!junk]))
+    stop()
+}
+codeDir <- get(load("codeDir.RData"))
+stopifnot(file.exists(file.path(codeDir, "hiReadsProcessor.R")))
+source(file.path(codeDir, "hiReadsProcessor.R"))
+
+## nesessary libraries
+stopifnot(require("ShortRead"))
+stopifnot(require("GenomicRanges"))
+stopifnot(require("igraph"))
+
+
 getTrimmedSeqs <- function(qualityThreshold, badQuality, qualityWindow, primer,
                            ltrbit, largeLTRFrag, linker, linker_common, mingDNA,
                            read1, read2, alias, vectorSeq){
   
   ##### Load libraries #####
-  library("hiReadsProcessor")
-  library("ShortRead")
+  ##library("hiReadsProcessor")
+  ##library("ShortRead")
   
   stats <- data.frame()
   message(alias)
@@ -162,7 +180,7 @@ getTrimmedSeqs <- function(qualityThreshold, badQuality, qualityWindow, primer,
                       tileSize=8, repMatch=112312, dots=1000, 
                       q="dna", t="dna", out="psl")
   
-  findAndRemoveVector <- function(reads, Vector, blatParameters, minLength=10){
+  findAndRemoveVector.eric <- function(reads, Vector, blatParameters, minLength=10){
     
     hits.v <- read.psl(blatSeqs(query=reads, subject=Vector, 
                                 blatParameters=blatParameters, parallel=F),
@@ -180,23 +198,23 @@ getTrimmedSeqs <- function(qualityThreshold, badQuality, qualityWindow, primer,
     
   }
   
-  tryCatch(reads.p <- findAndRemoveVector(reads.p, Vector,
+  tryCatch(reads.p <- findAndRemoveVector.eric(reads.p, Vector,
                                           blatParameters=blatParameters),
-           error=function(e){print(paste0("Caught ERROR in intSiteLogic: ",
-                                          e$message))})
+           error=function(e){print(paste0("Caught ERROR in intSiteLogic::findAndRemoveVector ",
+               e$message))})
   
-  tryCatch(reads.l <- findAndRemoveVector(reads.l, Vector,
+  tryCatch(reads.l <- findAndRemoveVector.eric(reads.l, Vector,
                                           blatParameters=blatParameters),
-           error=function(e){print(paste0("Caught ERROR in intSiteLogic: ",
-                                          e$message))})
+           error=function(e){print(paste0("Caught ERROR in intSiteLogic::findAndRemoveVector ",
+               e$message))})
   
   stats.bore$reads.p_afterVTrim <- length(reads.p)
   stats.bore$reads.l_afterVTrim <- length(reads.l)
   
   toload <- intersect(names(reads.p), names(reads.l))
   
-  stats.bore$reads.lLength <- mean(width(reads.l))  
-  stats.bore$reads.pLength <- mean(width(reads.p))
+  stats.bore$reads.lLength <- as.integer(mean(width(reads.l)))  
+  stats.bore$reads.pLength <- as.integer(mean(width(reads.p)))
   
   stats.bore$curated <- length(toload)
   
@@ -244,63 +262,67 @@ getTrimmedSeqs <- function(qualityThreshold, badQuality, qualityWindow, primer,
 processAlignments <- function(workingDir, minPercentIdentity, maxAlignStart, maxLength, refGenome){
   
   ##### Load libraries #####
-  library("hiReadsProcessor")
-  library("GenomicRanges")
+  ##library("hiReadsProcessor")
+  ##library("GenomicRanges")
   
   codeDir <- get(load("codeDir.RData"))
   source(paste0(codeDir, "/programFlow.R"))#for get_reference_genome function
   
   setwd(workingDir)
   
-  dereplicateSites <- function(uniqueReads){
-    #do the dereplication, but loose the coordinates
-    sites.reduced <- reduce(flank(uniqueReads, -5, both=TRUE), with.revmap=T)
+  standardizeSites <- function(unstandardizedSites){
+    if( ! length(unstandardizedSites) > 0){
+	return(unstandardizedSites)
+    }
+    #Get called start values for clustering  
+    unstandardizedSites$Position <- ifelse(strand(unstandardizedSites) == "+", start(unstandardizedSites), end(unstandardizedSites))
+    unstandardizedSites$Break <- ifelse(strand(unstandardizedSites) == "+", end(unstandardizedSites), start(unstandardizedSites))
+    unstandardizedSites$Score <- 95
+    unstandardizedSites$qEnd <- width(unstandardizedSites)
+    
+    #Positions clustered by 5L window and best position is chosen for cluster
+    standardized <- clusterSites(
+      psl.rd = unstandardizedSites,
+      weight = rep(1, length(unstandardizedSites)) 
+      )
+
+    start(standardized) <- ifelse(strand(standardized) == "+", 
+                                  standardized$clusteredPosition, standardized$Break)
+    end(standardized) <- ifelse(strand(standardized) == "-", 
+                                standardized$clusteredPosition, standardized$Break)
+    
+    standardized$Position <- NULL
+    standardized$Break <- NULL
+    standardized$score <- NULL
+    standardized$qEnd <- NULL
+    standardized$clusteredPosition <- NULL
+    standardized$clonecount <- NULL
+    standardized$clusterTopHit <- NULL
+    
+    sort(standardized)
+  }  
+  
+  
+  dereplicateSites <- function(sites){
+    #Reduce sites which have the same starts, but loose range info
+    #(no need to add a gapwidth as sites are standardized)
+    sites.reduced <- flank(sites, -1, start=TRUE)
+    sites.reduced <- unlist(reduce(sites.reduced, with.revmap=TRUE))
     sites.reduced$counts <- sapply(sites.reduced$revmap, length)
     
-    #order the unique sites as described by revmap
-    dereplicatedSites <- uniqueReads[unlist(sites.reduced$revmap)]
+    #Order original sites by revmap  
+    dereplicatedSites <- sites[unlist(sites.reduced$revmap)]
     
-    #if no sites are present, skip this step - keep doing the rest to provide a
-    #similar output to a successful dereplication
-    if(length(uniqueReads)>0){
-      #split the unique sites as described by revmap (sites.reduced$counts came from revmap above)
-      dereplicatedSites <- split(dereplicatedSites, Rle(values=seq(length(sites.reduced)), lengths=sites.reduced$counts))
-    }
+    #Skip this step and provide similar output if length(sites) = 0
+    if(length(sites) > 0){
+      dereplicatedSites <- split(dereplicatedSites, Rle(values = seq(length(sites.reduced)), lengths = sites.reduced$counts))
+    }  
     
-    #do the standardization - this will pick a single starting position and
-    #choose the longest fragment as ending position
-    dereplicatedSites <- unlist(reduce(dereplicatedSites, min.gapwidth=5))
+    #Dereplicate reads with same standardized starts and provide the longeset width
+    dereplicatedSites <- unlist(reduce(dereplicatedSites))
     mcols(dereplicatedSites) <- mcols(sites.reduced)
-    
+
     dereplicatedSites
-  }
-  
-  standardizeSites <- function(unstandardizedSites){
-    if(length(unstandardizedSites)>0){
-      dereplicated <- dereplicateSites(unstandardizedSites)
-      dereplicated$dereplicatedSiteID <- seq(length(dereplicated))
-      
-      #expand, keeping the newly standardized starts
-      standardized <- unname(dereplicated[rep(dereplicated$dereplicatedSiteID, dereplicated$counts)])
-      
-      #order the original object to match
-      unstandardizedSites <- unstandardizedSites[unlist(dereplicated$revmap)]
-      
-      #graft over the widths and metadata
-      trueBreakpoints <- start(flank(unstandardizedSites, -1, start=F))
-      standardizedStarts <- start(flank(standardized, -1, start=T))
-      standardized <- GRanges(seqnames=seqnames(standardized),
-                              ranges=IRanges(start=pmin(standardizedStarts, trueBreakpoints),
-                                             end=pmax(standardizedStarts, trueBreakpoints)),
-                              strand=strand(standardized),
-                              seqinfo=seqinfo(unstandardizedSites))
-      mcols(standardized) <- mcols(unstandardizedSites)
-      
-      standardized
-    }
-    else{
-      unstandardizedSites
-    }
   }
 
   #' clean up alignments and prepare for int site calling
@@ -432,11 +454,67 @@ processAlignments <- function(workingDir, minPercentIdentity, maxAlignStart, max
   unclusteredMultihits <- subset(properlyPairedAlignments, names(properlyPairedAlignments) %in% multihitNames)
   unclusteredMultihits <- standardizeSites(unclusteredMultihits) #not sure if this is required anymore
 
+  ########## IDENTIFY UNIQUELY-PAIRED READS (real sites) ##########  
+  allSites <- properlyPairedAlignments[!properlyPairedAlignments$ID %in% unclusteredMultihits$ID]
+  
+  save(allSites, file="rawSites.RData")
+  
+  allSites <- standardizeSites(allSites)
+  sites.final <- dereplicateSites(allSites)
+  
+  if(length(sites.final)>0){
+    sites.final$sampleName <- allSites[1]$sampleName
+    sites.final$posid <- paste0(as.character(seqnames(sites.final)),
+                                as.character(strand(sites.final)),
+                                start(flank(sites.final, width=-1, start=TRUE)))
+    }
+  
+  save(sites.final, file="sites.final.RData")
+  save(allSites, file="allSites.RData")
+
+  numAllSingleReads <- length(allSites)
+  stats <- cbind(stats, numAllSingleReads)
+  numAllSingleSonicLengths <- 0
+  if( length(sites.final)>0 ) {
+        numAllSingleSonicLengths <- length(unlist(sapply(1:length(sites.final), function(i){
+        unique(width(allSites[sites.final$revmap[[i]]]))})))
+  }
+  stats <- cbind(stats, numAllSingleSonicLengths)
+  numUniqueSites <- length(sites.final)
+  stats <- cbind(stats, numUniqueSites)
+  
+
+########## IDENTIFY IMPROPERLY-PAIRED READS (chimeras) ##########
+  singletonAlignments <- pairedAlignments[alignmentsPerPairing==1]
+  strand(singletonAlignments) <- strand(allAlignments[unlist(singletonAlignments$revmap)])
+  t <- table(names(singletonAlignments))
+  chimeras <- subset(singletonAlignments, names(singletonAlignments) %in% 
+                       names(subset(t, t==2))) #should be >=?
+  #not an already-assigned read
+  chimeras <- chimeras[!names(chimeras) %in% names(properlyPairedAlignments)]
+  chimeras <- split(chimeras, names(chimeras))
+  
+  chimeras <- subset(chimeras,
+                     sapply(chimeras, function(x){sum(R1Counts[x$pairingID]) ==
+                                                    sum(R2Counts[x$pairingID])}))
+  
+  dereplicatedChimeras <- dereplicateSites(unlist(chimeras, use.names=FALSE))
+  
+  chimera <- length(dereplicatedChimeras)
+  
+  stats <- cbind(stats, chimera)
+  
+  chimeraData <- list("chimeras"=chimeras, "dereplicatedChimeras"=dereplicatedChimeras)
+  save(chimeraData, file="chimeraData.RData")
+  save(stats, file="stats.RData")
+  
+
+  ########## IDENTIFY MULTIPLY-PAIRED READS (multihits) ##########  
   clusteredMultihitPositions <- GRangesList()
   clusteredMultihitLengths <- list()
 
   if(length(unclusteredMultihits) > 0){
-    library("igraph")
+    ##library("igraph")
     multihits.split <- split(unclusteredMultihits, unclusteredMultihits$ID)
     multihits.medians <- round(median(width(multihits.split))) #could have a half for a median
     multihits.split <- flank(multihits.split, -1, start=T) #now just care about solostart
@@ -460,47 +538,25 @@ processAlignments <- function(workingDir, minPercentIdentity, maxAlignStart, max
   save(multihitData, file="multihitData.RData")
   
   #making new variable multihitReads so that the naming in stats is nice
-  multihitReads <- length(multihitNames) #multihit names is already unique
+  ##multihitReads <- length(multihitNames) #multihit names is already unique
+  multihitReads <- length(unique(multihitData$unclusteredMultihits$ID))
   stats <- cbind(stats, multihitReads)
-  
-  ########## IDENTIFY UNIQUELY-PAIRED READS (real sites) ##########  
-  allSites <- properlyPairedAlignments[!properlyPairedAlignments$ID %in% unclusteredMultihits$ID]
-  
-  allSites <- standardizeSites(allSites)
-  sites.final <- dereplicateSites(allSites)
-  
-  if(length(sites.final)>0){
-    sites.final$sampleName <- allSites[1]$sampleName
-    sites.final$posid <- paste0(as.character(seqnames(sites.final)),
-                                as.character(strand(sites.final)),
-                                start(flank(sites.final, width=-1, start=TRUE)))
+
+  multihitSonicLengths <- 0
+  if( length(multihitData$clusteredMultihitLengths)>0 ) {
+        multihitSonicLengths <- sum(sapply(multihitData$clusteredMultihitLengths, nrow))
   }
-  save(sites.final, file="sites.final.RData")
-  save(allSites, file="allSites.RData")
+  stats <- cbind(stats, multihitSonicLengths) 
+  
+  multihitClusters <- length(multihitData$clusteredMultihitPositions) #
+  stats <- cbind(stats, multihitClusters)
   
   
-  ########## IDENTIFY IMPROPERLY-PAIRED READS (chimeras) ##########
-  singletonAlignments <- pairedAlignments[alignmentsPerPairing==1]
-  strand(singletonAlignments) <- strand(allAlignments[unlist(singletonAlignments$revmap)])
-  t <- table(names(singletonAlignments))
-  chimeras <- subset(singletonAlignments, names(singletonAlignments) %in% 
-                       names(subset(t, t==2))) #should be >=?
-  #not an already-assigned read
-  chimeras <- chimeras[!names(chimeras) %in% names(properlyPairedAlignments)]
-  chimeras <- split(chimeras, names(chimeras))
+  totalSonicLengths <- numAllSingleSonicLengths + multihitSonicLengths
+  stats <- cbind(stats, totalSonicLengths)
+  totalEvents <- numUniqueSites + multihitClusters
+  stats <- cbind(stats, totalEvents)
   
-  chimeras <- subset(chimeras,
-                     sapply(chimeras, function(x){sum(R1Counts[x$pairingID]) ==
-                                                    sum(R2Counts[x$pairingID])}))
-  
-  dereplicatedChimeras <- dereplicateSites(unlist(chimeras, use.names=FALSE))
-  
-  chimera <- length(dereplicatedChimeras)
-  
-  stats <- cbind(stats, chimera)
-  
-  chimeraData <- list("chimeras"=chimeras, "dereplicatedChimeras"=dereplicatedChimeras)
-  save(chimeraData, file="chimeraData.RData")
   save(stats, file="stats.RData")
   
 }

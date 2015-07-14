@@ -1,3 +1,6 @@
+library("ShortRead")
+library("BSgenome")
+
 bsub <- function(cpus=1, maxmem=NULL, wait=NULL, jobName=NULL, logFile=NULL, command=NULL){
   stopifnot(!is.null(maxmem))
   if(Sys.Date()>=as.Date("2015-06-01", "%Y-%m-%d")){
@@ -27,7 +30,6 @@ bsub <- function(cpus=1, maxmem=NULL, wait=NULL, jobName=NULL, logFile=NULL, com
 #takes a textual genome identifier (ie. hg18) and turns it into the correct
 #BSgenome object
 get_reference_genome <- function(reference_genome) {
-  library("BSgenome")
   pattern <- paste0("\\.", reference_genome, "$")
   match_index <- which(grepl(pattern, installed.genomes()))
   if (length(match_index) != 1) {
@@ -89,14 +91,7 @@ cleanup <- function(){
 }
 
 demultiplex <- function(){
-  #Demultiplexing is currently a single-core process - perhaps it could be made
-  #more efficient by having each error-correct worker do its own
-  #mini-demultiplex with the barcodes that it error corrected, then write their 
-  #own shorter fastq files which can be cat'd together after everything is done
-  
-  library("ShortRead")
-  
-  I1 <- readFasta(list.files("Data", pattern="correctedI1-.", full.names=T)) #readFasta("Data/correctedI1.fasta")
+  I1 <- readFasta(list.files("Data", pattern="correctedI1-.", full.names=T))
   
   completeMetadata <- get(load("completeMetadata.RData"))
   
@@ -105,33 +100,34 @@ demultiplex <- function(){
   
   #only necessary if using native data - can parse out description w/ python
   I1Names <-  sapply(strsplit(as.character(ShortRead::id(I1)), " "), "[[", 1)#for some reason we can't dynamically set name/id on ShortRead!
-
-  rm(I1)
   
   suppressWarnings(dir.create("Data/demultiplexedReps"))
   
-  #R1 
   R1 <- readFastq("Data/Undetermined_S0_L001_R1_001.fastq.gz")
-  R1Names <- sapply(strsplit(as.character(ShortRead::id(R1)), " "), "[[", 1)#for some reason we can't dynamically set name/id on ShortRead!
-  names(R1Names) <- NULL
+  demultiplex_reads(R1, "R1", I1Names, samples, completeMetadata)
   
-  R1 <- R1[match(I1Names, R1Names)]
-  R1 <- split(R1, samples)
-  for (i in 1:length(R1)){writeFastq(R1[[i]], paste0("Data/demultiplexedReps/", names(R1[i]), "_R1.fastq.gz"), mode="w")}
-  
-  rm(R1, R1Names)
-  
-  #R2
   R2 <- readFastq("Data/Undetermined_S0_L001_R2_001.fastq.gz")
-  R2Names <- sapply(strsplit(as.character(ShortRead::id(R2)), " "), "[[", 1) #for some reason we can't dynamically set name/id on ShortRead!
-  names(R2Names) <- NULL
-  
-  R2 <- R2[match(I1Names, R2Names)]
-  R2 <- split(R2, samples)
-  
-  for (i in 1:length(R2)){writeFastq(R2[[i]], paste0("Data/demultiplexedReps/", names(R2[i]), "_R2.fastq.gz"), mode="w")}
-  
-  rm(R2, R2Names, I1Names, samples) 
+  demultiplex_reads(R2, "R2", I1Names, samples, completeMetadata)
+}
+
+#' write fastq for each barcode and each sample
+#' @param reads fastq reads as parsed by readFastq()
+#' @param suffix either "R1" or "R2"
+demultiplex_reads <- function(reads, suffix, I1Names, samples, completeMetadata) {
+    RNames <- sapply(strsplit(as.character(ShortRead::id(reads)), " "), "[[", 1)#for some reason we can't dynamically set name/id on ShortRead!
+    names(RNames) <- NULL
+
+    reads <- reads[match(I1Names, RNames)]
+    reads <- split(reads, samples)
+    for (i in 1:length(reads)){
+        barcode.i <- completeMetadata$bcSeq[ completeMetadata$alias == names(reads)[i] ]
+        stopifnot(length(barcode.i)==1)
+        alias_by_barcode <- completeMetadata$alias[ completeMetadata$bcSeq == barcode.i ]
+        stopifnot(length(alias_by_barcode)>=1)
+        fqFiles <- paste0("Data/demultiplexedReps/", alias_by_barcode, "_", suffix, ".fastq.gz")
+        cat(barcode.i, "\t", paste(fqFiles, collapse=" "), "\n" )
+        null <- sapply(fqFiles, function(fq) writeFastq(reads[[i]], fq, mode="w") )
+    }  
 }
 
 errorCorrectBC <- function(){
@@ -167,7 +163,7 @@ errorCorrectBC <- function(){
   #trim seqs
   bsub(wait=paste0("done(BushmanDemultiplex_", bushmanJobID, ")"),
        jobName=paste0("BushmanTrimReads_", bushmanJobID, "[1-", nrow(completeMetadata), "]"),
-       maxmem=6000,
+       maxmem=16000,
        logFile="logs/trimOutput%I.txt",
        command=paste0("Rscript -e \"source('", codeDir, "/programFlow.R'); trimReads();\"")
   )
@@ -261,6 +257,9 @@ processMetadata <- function(){
   codeDir <- normalizePath(parsedArgs$codeDir)
   cleanup <- parsedArgs$cleanup
 
+    source(file.path(codeDir, 'linker_common.R'))
+    source(file.path(codeDir, 'read_sample_files.R'))
+
   #setting R's working dir also sets shell location for system calls, thus
   #primaryAnalysisDir is propagated without being saved
   setwd(parsedArgs$primaryAnalysisDir)
@@ -269,23 +268,14 @@ processMetadata <- function(){
   save(codeDir, file=paste0(getwd(), "/codeDir.RData"))
   save(cleanup, file=paste0(getwd(), "/cleanup.RData"))
 
-  #mapping files must exist in given primary analysis dir
-  stopifnot(file.exists("sampleInfo.csv") & file.exists("processingParams.csv"))
-
-  sampleInfo <- read.csv("sampleInfo.csv", stringsAsFactors=F)
-  processingParams <- read.csv("processingParams.csv", stringsAsFactors=F)
-
-  #confirm that metadata is presented as we expect
-  stopifnot(nrow(sampleInfo) == nrow(processingParams))
-  stopifnot(!(is.null(sampleInfo$alias) | is.null(processingParams$alias)))
-  stopifnot(all(sampleInfo$alias %in% processingParams$alias))
-
-  completeMetadata <- merge(sampleInfo, processingParams, "alias")
-
-  #override because R thinks "F" means FALSE when all gender values are "F"
-  completeMetadata$gender[with(completeMetadata, gender==F)] <- "F"
-  completeMetadata$gender <- toupper(completeMetadata$gender)
-
+    sample_file <- 'sampleInfo.tsv'
+    proc_file <- "processingParams.tsv"
+    if ( ! file.exists(proc_file)) { # have to use default
+        default <- "default_processingParams.tsv"
+        proc_file <- file.path(codeDir, default)
+    }
+    completeMetadata <- read_sample_processing_files(sample_file, proc_file)
+  
   completeMetadata$read1 <- paste0(getwd(), "/Data/demultiplexedReps/", completeMetadata$alias, "_R1.fastq.gz")
   completeMetadata$read2 <- paste0(getwd(), "/Data/demultiplexedReps/", completeMetadata$alias, "_R2.fastq.gz")
 
@@ -293,7 +283,9 @@ processMetadata <- function(){
                   "primer", "ltrBit", "largeLTRFrag", "linkerSequence", "linkerCommon",
                   "mingDNA", "read1", "read2", "alias", "vectorSeq", "minPctIdent",
                   "maxAlignStart", "maxFragLength", "gender") %in% names(completeMetadata)))
-
+  
+  stopifnot(all( file.exists(completeMetadata$vectorSeq) ))
+  
   save(completeMetadata, file="completeMetadata.RData")
 
   suppressWarnings(dir.create("logs"))
